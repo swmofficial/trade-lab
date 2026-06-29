@@ -1,0 +1,13 @@
+# Lab-level ignores — apply to every component subfolder.
+
+# Secrets — never commit, in any component
+**/.env
+
+# Local SQLite stores — regenerable, in any component
+**/*.db
+
+# Python
+**/__pycache__/
+*.pyc
+.venv/
+venv/

@@ -10,7 +10,9 @@ Run directly:  python tests/test_engine.py   (prints PASS/FAIL per case, exits n
 on any failure). Also importable by pytest (test_* functions).
 """
 
+import math
 import os
+import random
 import sys
 from collections import namedtuple
 from datetime import date, timedelta
@@ -20,7 +22,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from strategy import mean_reversion_signals
 from engine import run_backtest
 import costs
+import data
 import walkforward as wf
+import noise_null as nn
 
 # Minimal bar for tests — the engine/strategy only read .date and .close.
 TBar = namedtuple("TBar", "date open high low close volume")
@@ -315,6 +319,123 @@ def case_non_overlap():
     return True
 
 
+# ==================================================================================
+# PERMUTATION NOISE NULL GATE (Brick 2d). Prove the null machinery is honest.
+# ==================================================================================
+
+# A deliberately small but real walk-forward scheme, so the teeth/false-positive tests
+# run many surrogates quickly. It exercises the SAME machinery as the production scheme.
+WF_SMALL = dict(
+    train_years=2, test_years=1, step_years=1, min_test_years=0.5,
+    grid=[(10, 1.5), (10, 2.5), (20, 2.0), (30, 2.0)],
+)
+
+
+def _make_dated(closes, start=date(2002, 1, 1)):
+    """Consecutive-calendar-day bars from a close series (walk-forward only reads
+    dates for fold boundaries; weekends are irrelevant to the harness)."""
+    return [
+        TBar(start + timedelta(days=i), c, c, c, c, 0.0)
+        for i, c in enumerate(closes)
+    ]
+
+
+def _ou_closes(n, seed, theta=0.35, sigma=0.012, start=1.20):
+    """STRONG mean-reverting (OU / AR(1)) log-price -> reverting prices. Dips revert,
+    so the mean-reversion strategy genuinely profits on the ordered series."""
+    rng = random.Random(seed)
+    x = 0.0
+    closes = [start]
+    for _ in range(n - 1):
+        x = (1.0 - theta) * x + sigma * rng.gauss(0.0, 1.0)
+        closes.append(start * math.exp(x))
+    return closes
+
+
+def _rw_closes(n, seed, sigma=0.012, start=1.20):
+    """Pure random walk: IID returns, NO serial structure to exploit."""
+    rng = random.Random(seed)
+    x = 0.0
+    closes = [start]
+    for _ in range(n - 1):
+        x = x + sigma * rng.gauss(0.0, 1.0)
+        closes.append(start * math.exp(x))
+    return closes
+
+
+# --- Case 12: IDENTITY REPRODUCES 2c (key) ----------------------------------------
+#
+# If feeding the real closes through the null pipeline with an identity permutation does
+# NOT reproduce the 2c OOS number, then the null tests a DIFFERENT pipeline and every
+# p-value is meaningless. (Touches the real DB read-only.)
+def case_null_identity_reproduces_2c():
+    bars, _ = data.load_bars("EUR/USD")
+    ref, _ = nn.walk_forward_oos(bars)  # default scheme == Brick 2c
+
+    pbars = nn.permuted_bars(bars, nn.identity_perm(bars))
+    # Reconstructed closes ~= originals (log->cumsum->exp round-trip).
+    max_diff = max(abs(b.close - pb.close) for b, pb in zip(bars, pbars))
+    assert max_diff <= 1e-9, f"identity reconstruction drifted: max |diff|={max_diff}"
+
+    ident, _ = nn.walk_forward_oos(pbars)
+    assert approx(ident, ref, 1e-9), f"identity OOS {ident} != 2c OOS {ref}"
+    return True
+
+
+# --- Case 13: a permutation is a permutation (multiset preserved) ------------------
+def case_permutation_is_permutation():
+    closes = _rw_closes(60, seed=5)
+    rets = nn.log_returns(closes)
+    rng = random.Random(99)
+    perm = list(range(len(rets)))
+    rng.shuffle(perm)
+    prets = [rets[i] for i in perm]
+
+    assert len(prets) == len(rets)
+    assert approx(sum(prets), sum(rets), 1e-12), "permutation changed the sum of returns"
+    for a, b in zip(sorted(prets), sorted(rets)):
+        assert approx(a, b, 1e-12), "permutation changed the multiset of returns"
+    assert prets != rets, "shuffle left order identical (degenerate test)"
+    return True
+
+
+# --- Case 14a: TEETH — strong mean reversion lands in the RIGHT TAIL ---------------
+def case_null_detects_real_edge():
+    bars = _make_dated(_ou_closes(2920, seed=7))
+    real, _ = nn.walk_forward_oos(bars, **WF_SMALL)
+    null = nn.null_distribution(bars, n=40, seed=1234, **WF_SMALL)
+    pct = nn.percentile_of(real, null)
+    assert pct >= 0.9, (
+        f"real edge not detected: real={real:.2f} sits at pct={pct:.2f} "
+        f"(null p95={nn.percentile(null, 0.95):.2f})"
+    )
+    return True
+
+
+# --- Case 14b: FALSE-POSITIVE GUARD — random walk does NOT separate ----------------
+def case_null_rejects_random_walk():
+    bars = _make_dated(_rw_closes(2920, seed=3))
+    real, _ = nn.walk_forward_oos(bars, **WF_SMALL)
+    null = nn.null_distribution(bars, n=40, seed=1234, **WF_SMALL)
+    pct = nn.percentile_of(real, null)
+    assert 0.1 <= pct <= 0.9, (
+        f"random walk falsely separated: real={real:.2f} at pct={pct:.2f} "
+        "(null should NOT manufacture significance from noise)"
+    )
+    return True
+
+
+# --- Case 15: SEED DETERMINISM — same seed -> identical null -----------------------
+def case_null_seed_determinism():
+    bars = _make_dated(_rw_closes(1500, seed=11))
+    a = nn.null_distribution(bars, n=12, seed=1234, **WF_SMALL)
+    b = nn.null_distribution(bars, n=12, seed=1234, **WF_SMALL)
+    c = nn.null_distribution(bars, n=12, seed=9999, **WF_SMALL)
+    assert a == b, "same seed produced different null distributions"
+    assert a != c, "different seed produced identical null (RNG not seeded?)"
+    return True
+
+
 CASES = [
     ("one dip+revert -> exactly 1 trade, hand-checked", case_one_trade),
     ("clean rising series -> 0 trades", case_no_trade),
@@ -327,6 +448,11 @@ CASES = [
     ("WF no outcome bleed: test prices can't pick params", case_no_outcome_bleed),
     ("WF boundary: history OK, no lookahead", case_boundary_history_not_lookahead),
     ("WF non-overlap: no bar in two test windows", case_non_overlap),
+    ("NULL identity reproduces 2c (key)", case_null_identity_reproduces_2c),
+    ("NULL permutation preserves return multiset", case_permutation_is_permutation),
+    ("NULL detects real edge (OU -> right tail)", case_null_detects_real_edge),
+    ("NULL rejects random walk (no false positive)", case_null_rejects_random_walk),
+    ("NULL seed determinism", case_null_seed_determinism),
 ]
 
 
@@ -373,6 +499,26 @@ def test_boundary_history_not_lookahead():
 
 def test_non_overlap():
     assert case_non_overlap()
+
+
+def test_null_identity_reproduces_2c():
+    assert case_null_identity_reproduces_2c()
+
+
+def test_permutation_is_permutation():
+    assert case_permutation_is_permutation()
+
+
+def test_null_detects_real_edge():
+    assert case_null_detects_real_edge()
+
+
+def test_null_rejects_random_walk():
+    assert case_null_rejects_random_walk()
+
+
+def test_null_seed_determinism():
+    assert case_null_seed_determinism()
 
 
 def main():

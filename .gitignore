@@ -11,3 +11,6 @@
 *.pyc
 .venv/
 venv/
+
+# Obsidian vault config (this repo lives inside a OneDrive-synced vault)
+.obsidian/

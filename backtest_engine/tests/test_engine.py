@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from strategy import mean_reversion_signals
 from engine import run_backtest
+import costs
 
 # Minimal bar for tests — the engine/strategy only read .date and .close.
 TBar = namedtuple("TBar", "date open high low close volume")
@@ -49,17 +50,20 @@ def approx(a, b, tol=APPROX):
 #   i=4 window=[12,11,9]  -> SMA=10.66667; close 11.0 >= SMA -> EXIT at 11.0
 #   return = (11-9)/9 = 0.222222... -> 22.2222%; remaining bars never re-breach.
 def case_one_trade():
+    # spread_pips=0 -> costs off -> reproduces Brick 2a's GROSS numbers exactly.
     bars = make_bars([10, 12, 11, 9, 11, 11, 11, 11])
     sigs = mean_reversion_signals(bars, lookback=3, k=2.0)
-    res = run_backtest(bars, sigs, starting_equity=10000.0)
+    res = run_backtest(bars, sigs, "EUR/USD", starting_equity=10000.0, spread_pips=0)
 
     assert len(res.trades) == 1, f"expected 1 trade, got {len(res.trades)}"
     t = res.trades[0]
     assert approx(t.entry_price, 9.0), t.entry_price
     assert approx(t.exit_price, 11.0), t.exit_price
-    assert approx(t.return_pct, (11 - 9) / 9 * 100), t.return_pct
+    assert approx(t.gross_return_pct, (11 - 9) / 9 * 100), t.gross_return_pct
+    # costs off: net must equal gross to the bit.
+    assert approx(t.net_return_pct, t.gross_return_pct), t.net_return_pct
     assert res.open_position is None, "should be flat at end"
-    # equity = 10000 * (1 + 2/9)
+    # equity = 10000 * (1 + 2/9) — identical to Brick 2a.
     assert approx(res.final_equity, 10000.0 * (1 + 2 / 9)), res.final_equity
     return True
 
@@ -68,7 +72,7 @@ def case_one_trade():
 def case_no_trade():
     bars = make_bars([10, 11, 12, 13, 14, 15, 16, 17])  # monotonic up, never dips
     sigs = mean_reversion_signals(bars, lookback=3, k=2.0)
-    res = run_backtest(bars, sigs, starting_equity=10000.0)
+    res = run_backtest(bars, sigs, "EUR/USD", starting_equity=10000.0, spread_pips=0)
 
     assert sigs.count("enter_long") == 0, sigs
     assert len(res.trades) == 0, res.trades
@@ -84,7 +88,7 @@ def case_no_trade():
 def case_open_position():
     bars = make_bars([10, 12, 11, 9, 8, 7, 6])
     sigs = mean_reversion_signals(bars, lookback=3, k=2.0)
-    res = run_backtest(bars, sigs, starting_equity=10000.0)
+    res = run_backtest(bars, sigs, "EUR/USD", starting_equity=10000.0, spread_pips=0)
 
     assert len(res.trades) == 0, f"no trade should close, got {res.trades}"
     assert res.open_position is not None, "open position must be reported"
@@ -121,11 +125,71 @@ def case_lookahead_guard():
     return True
 
 
+# --- Case 5: pip size is per-pair, not a constant ---------------------------------
+def case_pip_size():
+    assert costs.pip_size("USD/JPY") == 0.01, costs.pip_size("USD/JPY")
+    assert costs.pip_size("EUR/USD") == 0.0001, costs.pip_size("EUR/USD")
+    # GBP/USD is a non-yen major -> 0.0001 like EUR/USD.
+    assert costs.pip_size("GBP/USD") == 0.0001, costs.pip_size("GBP/USD")
+    return True
+
+
+# --- Case 6: cost moves net by EXACTLY the hand-computed amount --------------------
+#
+# Reuse the hand-checked one-trade case (entry 9.0, exit 11.0, gross +22.2222%).
+# spread_pips=2.0, EUR/USD pip=0.0001:
+#   cost_fraction = (2.0 * 0.0001) / 9.0 = 0.0002 / 9.0 = 0.0000222222...
+#   net_pct = gross_pct - cost_fraction*100 = 22.2222% - 0.00222222...%
+# The shift must be EXACT, not approximate.
+def case_cost_is_exact():
+    bars = make_bars([10, 12, 11, 9, 11, 11, 11, 11])
+    sigs = mean_reversion_signals(bars, lookback=3, k=2.0)
+
+    spread = 2.0
+    res = run_backtest(bars, sigs, "EUR/USD", starting_equity=10000.0, spread_pips=spread)
+    assert len(res.trades) == 1, res.trades
+    t = res.trades[0]
+
+    hand_cost_pct = (spread * 0.0001 / 9.0) * 100.0
+    assert approx(t.gross_return_pct, (11 - 9) / 9 * 100), t.gross_return_pct
+    assert approx(t.net_return_pct, t.gross_return_pct - hand_cost_pct), (
+        t.net_return_pct,
+        t.gross_return_pct - hand_cost_pct,
+    )
+    # And the cost actually bit (sanity: net strictly below gross).
+    assert t.net_return_pct < t.gross_return_pct
+    # equity compounds NET, not gross.
+    assert approx(res.final_equity, 10000.0 * (1 + t.net_return_pct / 100.0))
+    return True
+
+
+# --- Case 7: spread_pips=0 reproduces Brick 2a gross EXACTLY -----------------------
+#
+# Across a non-trivial multi-trade synthetic series, costs-off net must equal gross
+# trade-by-trade, and final equity must equal compounding the gross returns. Proves
+# the cost layer is the ONLY thing changed.
+def case_costs_off_equals_2a():
+    bars = make_bars([10, 12, 11, 9, 11, 8, 11, 7, 11, 11])
+    sigs = mean_reversion_signals(bars, lookback=3, k=2.0)
+    res = run_backtest(bars, sigs, "EUR/USD", starting_equity=10000.0, spread_pips=0)
+
+    assert len(res.trades) >= 2, "want multiple trades to make this meaningful"
+    eq = 10000.0
+    for t in res.trades:
+        assert approx(t.net_return_pct, t.gross_return_pct), t  # costs off
+        eq *= 1 + t.gross_return_pct / 100.0
+    assert approx(res.final_equity, eq), (res.final_equity, eq)
+    return True
+
+
 CASES = [
     ("one dip+revert -> exactly 1 trade, hand-checked", case_one_trade),
     ("clean rising series -> 0 trades", case_no_trade),
     ("enter, never revert -> position stays OPEN", case_open_position),
     ("LOOKAHEAD GUARD: band at i excludes bar i", case_lookahead_guard),
+    ("pip size per-pair (JPY 0.01, others 0.0001)", case_pip_size),
+    ("cost shifts net by EXACT hand amount", case_cost_is_exact),
+    ("spread_pips=0 reproduces gross EXACTLY", case_costs_off_equals_2a),
 ]
 
 
@@ -144,6 +208,18 @@ def test_open_position():
 
 def test_lookahead_guard():
     assert case_lookahead_guard()
+
+
+def test_pip_size():
+    assert case_pip_size()
+
+
+def test_cost_is_exact():
+    assert case_cost_is_exact()
+
+
+def test_costs_off_equals_2a():
+    assert case_costs_off_equals_2a()
 
 
 def main():

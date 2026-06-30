@@ -5,8 +5,10 @@ Deliberately NOT computed yet (need more care / assumptions — later bricks):
   annualized return, Sharpe / Sortino, exposure-adjusted returns. Printing those now
   would imply a rigor this brick does not have.
 
-A win is a strictly positive return; a zero-return trade counts as a loss (it is not
-a win). avg_win / avg_loss are means over those subsets, in percent.
+A win is a strictly positive NET return; a zero/negative NET trade counts as a loss.
+avg_win / avg_loss are means over those subsets, in percent. All headline stats are on
+NET (cost-inclusive) returns; gross_total_return_pct is provided alongside so the cost
+erosion is visible.
 """
 
 
@@ -25,8 +27,17 @@ def _max_drawdown_pct(equity_curve):
     return max_dd
 
 
+def gross_total_return_pct(result):
+    """Total return if costs were off: compound each trade's GROSS return from the
+    same starting equity. Lets the report show exactly how much costs ate."""
+    equity = result.starting_equity
+    for t in result.trades:
+        equity *= 1.0 + t.gross_return_pct / 100.0
+    return (equity - result.starting_equity) / result.starting_equity * 100.0
+
+
 def compute_metrics(result):
-    """Take a BacktestResult, return a dict of summary stats."""
+    """Take a BacktestResult, return a dict of summary stats. Headline stats are NET."""
     trades = result.trades
     n = len(trades)
 
@@ -36,16 +47,19 @@ def compute_metrics(result):
         * 100.0
     )
 
-    wins = [t for t in trades if t.return_pct > 0]
-    losses = [t for t in trades if t.return_pct <= 0]
+    wins = [t for t in trades if t.net_return_pct > 0]
+    losses = [t for t in trades if t.net_return_pct <= 0]
 
     win_rate_pct = (len(wins) / n * 100.0) if n else 0.0
-    avg_win_pct = (sum(t.return_pct for t in wins) / len(wins)) if wins else 0.0
-    avg_loss_pct = (sum(t.return_pct for t in losses) / len(losses)) if losses else 0.0
+    avg_win_pct = (sum(t.net_return_pct for t in wins) / len(wins)) if wins else 0.0
+    avg_loss_pct = (
+        (sum(t.net_return_pct for t in losses) / len(losses)) if losses else 0.0
+    )
 
     return {
         "num_trades": n,
         "total_return_pct": total_return_pct,
+        "gross_total_return_pct": gross_total_return_pct(result),
         "win_rate_pct": win_rate_pct,
         "avg_win_pct": avg_win_pct,
         "avg_loss_pct": avg_loss_pct,
@@ -58,11 +72,12 @@ def format_metrics(m):
     """Human-readable block for the runner. Honest: no Sharpe/annualized yet."""
     lines = [
         f"  trades            : {m['num_trades']}",
-        f"  total return      : {m['total_return_pct']:+.2f}%",
-        f"  win rate          : {m['win_rate_pct']:.1f}%",
-        f"  avg win           : {m['avg_win_pct']:+.2f}%",
-        f"  avg loss          : {m['avg_loss_pct']:+.2f}%",
-        f"  max drawdown      : {m['max_drawdown_pct']:.2f}%",
+        f"  gross return      : {m['gross_total_return_pct']:+.2f}%  (costs off)",
+        f"  net total return  : {m['total_return_pct']:+.2f}%",
+        f"  win rate (net)    : {m['win_rate_pct']:.1f}%",
+        f"  avg net win       : {m['avg_win_pct']:+.2f}%",
+        f"  avg net loss      : {m['avg_loss_pct']:+.2f}%",
+        f"  max drawdown (net): {m['max_drawdown_pct']:.2f}%",
     ]
     if m["open_position"]:
         lines.append("  NOTE              : a position is still OPEN at series end")

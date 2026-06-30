@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from strategy import mean_reversion_signals
 from engine import run_backtest
 import costs
+import walkforward as wf
 
 # Minimal bar for tests — the engine/strategy only read .date and .close.
 TBar = namedtuple("TBar", "date open high low close volume")
@@ -182,6 +183,138 @@ def case_costs_off_equals_2a():
     return True
 
 
+# ==================================================================================
+# WALK-FORWARD LEAKAGE GATE (Brick 2c). The most important gate in the project so far.
+# ==================================================================================
+
+# A two-combo grid: A is narrow-band (enters on small dips), B is wide-band (enters
+# only on deep dips). lookback=2 keeps every band hand-computable.
+A = (2, 1.0)
+B = (2, 3.0)
+GRID_AB = [A, B]
+
+# A single consecutive-day series, partitioned into history / train / test by date.
+#   01-01,01-02 : history (warmup for train)
+#   01-03..01-06: TRAIN  -> A takes a +4% trade, B never enters  => TRAIN favors A
+#   01-07..01-11: TEST   -> A enters shallow @10.18, B enters deep @10.05, both exit
+#                           @10.30 => B (deeper entry) beats A   => TEST favors B
+# So train-optimal (A) != test-optimal (B). An honest harness must FREEZE A onto test.
+FREEZE_CLOSES = [10.0, 10.4, 9.9, 10.3, 10.2, 10.25, 10.18, 10.05, 10.30, 10.28, 10.30]
+TRAIN_START = date(2024, 1, 3)
+TRAIN_END = date(2024, 1, 7)   # exclusive -> train bars 01-03..01-06
+TEST_START = date(2024, 1, 7)
+TEST_END = date(2024, 1, 12)   # exclusive -> test bars 01-07..01-11
+
+
+def _freeze_bars(closes=FREEZE_CLOSES):
+    return make_bars(closes, start="2024-01-01")
+
+
+# --- Case 8: PARAM FREEZE (the one that proves the harness is honest) --------------
+def case_param_freeze():
+    bars = _freeze_bars()
+
+    # Train picks A.
+    chosen, _train_ret, _ = wf.optimize_on_train(
+        bars, TRAIN_START, TRAIN_END, grid=GRID_AB, spread_pips=0
+    )
+    assert chosen == A, f"train should favor A={A}, picked {chosen}"
+
+    # TEETH: B must genuinely be test-optimal, else the test proves nothing.
+    a_test = wf.net_total_return(
+        wf.run_window(bars, TEST_START, TEST_END, A[0], A[1], spread_pips=0)
+    )
+    b_test = wf.net_total_return(
+        wf.run_window(bars, TEST_START, TEST_END, B[0], B[1], spread_pips=0)
+    )
+    assert b_test > a_test, (
+        f"test lacks teeth: B not test-optimal (a={a_test}, b={b_test})"
+    )
+
+    # The harness must use the TRAIN-chosen A on test, NOT the test-optimal B.
+    fold = wf.Fold(TRAIN_START, TRAIN_END, TEST_START, TEST_END, False)
+    fr = wf.run_fold(bars, fold, grid=GRID_AB, spread_pips=0)
+    assert fr.params == A, f"harness leaked: used {fr.params}, must freeze {A}"
+    assert approx(fr.test_return, a_test), (fr.test_return, a_test)
+    assert not approx(fr.test_return, b_test), "harness produced test-optimal return!"
+    return True
+
+
+# --- Case 9: NO OUTCOME BLEED — test prices cannot change param selection ----------
+def case_no_outcome_bleed():
+    bars = _freeze_bars()
+    chosen1, _, _ = wf.optimize_on_train(bars, TRAIN_START, TRAIN_END, grid=GRID_AB)
+
+    # Rewrite ONLY the test-period closes (indices 6..10) to wildly different values.
+    mutated = list(FREEZE_CLOSES)
+    mutated[6:] = [5.0, 20.0, 3.0, 18.0, 4.0]
+    bars2 = _freeze_bars(mutated)
+
+    chosen2, _, _ = wf.optimize_on_train(bars2, TRAIN_START, TRAIN_END, grid=GRID_AB)
+    assert chosen1 == chosen2, (
+        f"LEAK: test prices changed the chosen params {chosen1} -> {chosen2}"
+    )
+
+    # run_fold on both must freeze the SAME params, but the measured test return DOES
+    # change with test prices (selection frozen, outcome measured).
+    fold = wf.Fold(TRAIN_START, TRAIN_END, TEST_START, TEST_END, False)
+    fr1 = wf.run_fold(bars, fold, grid=GRID_AB)
+    fr2 = wf.run_fold(bars2, fold, grid=GRID_AB)
+    assert fr1.params == fr2.params == chosen1
+    assert not approx(fr1.test_return, fr2.test_return), (
+        "test prices changed but measured outcome did not — window not reading test data"
+    )
+    return True
+
+
+# --- Case 10: BOUNDARY history OK, boundary lookahead NOT --------------------------
+#
+# History [10.0, 10.1, 10.0] makes a tight band; the FIRST test bar (9.0) dips below it
+# and must ENTER -> proves prior history feeds the band (not wasted as 'hold'). The
+# WRONG inclusive band [10.1,10.0,9.0] would NOT enter -> proves the current bar is
+# excluded from its own band at the window boundary.
+def case_boundary_history_not_lookahead():
+    closes = [10.0, 10.1, 10.0, 9.0, 11.0, 11.0]
+    bars = make_bars(closes, start="2024-02-01")
+    tstart = date(2024, 2, 4)  # first test bar = the 9.0 dip
+    tend = date(2024, 2, 7)
+
+    res = wf.run_window(bars, tstart, tend, lookback=3, k=2.0, spread_pips=0)
+    assert len(res.trades) >= 1, "history not used: first test bar produced no band/trade"
+    assert res.trades[0].entry_date == tstart, (
+        f"entry should be at the window's first bar (history-warmed band), "
+        f"got {res.trades[0].entry_date}"
+    )
+
+    # TEETH: the inclusive (lookahead) band would NOT have entered.
+    incl = [10.1, 10.0, 9.0]
+    m = sum(incl) / 3
+    std = (sum((x - m) ** 2 for x in incl) / 3) ** 0.5
+    assert 9.0 >= m - 2.0 * std, "inclusive band would also enter; test lacks teeth"
+    return True
+
+
+# --- Case 11: NON-OVERLAP — no calendar bar in two TEST windows --------------------
+def case_non_overlap():
+    # Monthly bars over 16 years -> several full folds + a short final one (dropped).
+    bars = []
+    for y in range(2000, 2016):
+        for mth in range(1, 13):
+            bars.append(TBar(date(y, mth, 1), 10.0, 10.0, 10.0, 10.0, 0.0))
+
+    folds, dropped = wf.make_folds(bars)
+    assert len(folds) >= 2, f"expected several folds, got {len(folds)}"
+
+    seen = {}
+    for idx, f in enumerate(folds):
+        for b in wf.slice_window(bars, f.test_start, f.test_end):
+            assert b.date not in seen, (
+                f"bar {b.date} appears in test windows {seen[b.date]} and {idx}"
+            )
+            seen[b.date] = idx
+    return True
+
+
 CASES = [
     ("one dip+revert -> exactly 1 trade, hand-checked", case_one_trade),
     ("clean rising series -> 0 trades", case_no_trade),
@@ -190,6 +323,10 @@ CASES = [
     ("pip size per-pair (JPY 0.01, others 0.0001)", case_pip_size),
     ("cost shifts net by EXACT hand amount", case_cost_is_exact),
     ("spread_pips=0 reproduces gross EXACTLY", case_costs_off_equals_2a),
+    ("WF PARAM FREEZE: train params frozen onto test", case_param_freeze),
+    ("WF no outcome bleed: test prices can't pick params", case_no_outcome_bleed),
+    ("WF boundary: history OK, no lookahead", case_boundary_history_not_lookahead),
+    ("WF non-overlap: no bar in two test windows", case_non_overlap),
 ]
 
 
@@ -220,6 +357,22 @@ def test_cost_is_exact():
 
 def test_costs_off_equals_2a():
     assert case_costs_off_equals_2a()
+
+
+def test_param_freeze():
+    assert case_param_freeze()
+
+
+def test_no_outcome_bleed():
+    assert case_no_outcome_bleed()
+
+
+def test_boundary_history_not_lookahead():
+    assert case_boundary_history_not_lookahead()
+
+
+def test_non_overlap():
+    assert case_non_overlap()
 
 
 def main():
